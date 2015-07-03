@@ -32,7 +32,7 @@ import sys
 import types
 
 __author__ = 'Jon Parise <jon@indelible.org>'
-__version__ = '0.6'
+__version__ = '0.6.ok.patched.1'
 
 __all__ = ('enable', 'disable', 'get_dependencies', 'reload')
 
@@ -40,6 +40,7 @@ _baseimport = builtins.__import__
 _blacklist = None
 _dependencies = dict()
 _parent = None
+_parent_from_list = None
 
 # Jython doesn't have imp.reload().
 if not hasattr(imp, 'reload'):
@@ -87,7 +88,8 @@ def _deepcopy_module_dict(m):
     del d['__builtins__']
     return copy.deepcopy(d)
 
-def _reload(m, visited):
+def _reload(m, visited, scope=None, verbose=False):
+    assert scope is None or callable(scope)
     """Internal module reloading routine."""
     name = m.__name__
 
@@ -106,8 +108,16 @@ def _reload(m, visited):
     deps = _dependencies.get(name, None)
     if deps is not None:
         for dep in reversed(deps):
-            if dep not in visited:
-                _reload(dep, visited)
+            if dep in visited:
+                if verbose: print("reload:    dependency %s visited. Skipped" % dep.__name__)
+            else:
+                if scope is not None and not scope(dep):
+                    if verbose: print("reload:    dependency %s out of scope. Skipped" % dep.__name__)
+                    continue
+                elif verbose:
+                    print("reload:    dependency %s of %s" % (dep.__name__, name))
+
+                _reload(dep, visited, scope=scope, verbose=verbose)
 
     # Clear this module's list of dependencies.  Some import statements may
     # have been removed.  We'll rebuild the dependency list as part of the
@@ -124,6 +134,8 @@ def _reload(m, visited):
     global _parent
     _parent = name
 
+    if verbose: print("reload: module %s" % name)
+
     # If the module has a __reload__(d) function, we'll call it with a copy of
     # the original module's dictionary after it's been reloaded.
     callback = getattr(m, '__reload__', None)
@@ -137,28 +149,31 @@ def _reload(m, visited):
     # Reset our parent pointer now that the reloading operation is complete.
     _parent = None
 
-def reload(m):
+def reload(m, scope=None, verbose=False):
     """Reload an existing module.
 
     Any known dependencies of the module will also be reloaded.
 
     If a module has a __reload__(d) function, it will be called with a copy of
     the original module's dictionary after the module is reloaded."""
-    _reload(m, set())
+    _reload(m, set(), scope=scope, verbose=verbose)
 
 def _import(name, globals=None, locals=None, fromlist=None, level=_default_level):
     """__import__() replacement function that tracks module dependencies."""
     # Track our current parent module.  This is used to find our current place
     # in the dependency graph.
-    global _parent
+    global _parent, _parent_from_list
     parent = _parent
+    parent_from_list = _parent_from_list
     _parent = name
+    _parent_from_list = fromlist
 
     # Perform the actual import work using the base import function.
     base = _baseimport(name, globals, locals, fromlist, level)
 
-    if base is not None and parent is not None:
+    if base is not None:
         m = base
+        m_sub = []
 
         # We manually walk through the imported hierarchy because the import
         # function only returns the top-level package reference for a nested
@@ -172,14 +187,58 @@ def _import(name, globals=None, locals=None, fromlist=None, level=_default_level
                     m = getattr(m, component)
                 except AttributeError:
                     m = sys.modules[m.__name__ + '.' + component]
+        elif fromlist != ('*',):
+            # FIX (ok.20150702): check if fromlist contains modules, i.e. dependencies
+            # Here are two options:
+            # 1) m is package and fromlist consist of a) submodules b) attributes in __init__
+            # 2) m is module and fromlist consist of module's attributes which can have references to modules
+            # Actually, attributes can be objects from another module imported into m, i.e. dependency as well,
+            # but they will be resolved as dependency of m. I.e. here checked 1.a case only.
+            for fromname in fromlist:
+                try:
+                    if not hasattr(m, fromname):
+                        # fromname is not module attribute and _baseimport has not failed importing them.
+                        # Most brobably they are submodules of package
+                        submodule = sys.modules.get(m.__name__ + '.' + fromname)
+                    else:
+                        submodule = getattr(m, fromname)
+                    if isinstance(submodule, types.ModuleType) and submodule not in _dependencies.get(m.__name__, []):
+                        m_sub.append(submodule)
+                except Exception as e:
+                    print('Something happened during submodule check', e)
+                    raise
 
         # If this is a nested import for a reloadable (source-based) module,
         # we append ourself to our parent's dependency list.
         if hasattr(m, '__file__'):
-            l = _dependencies.setdefault(parent, [])
-            l.append(m)
+            if parent is not None:
+                actual_parent = parent
+                if globals is not None and len(parent) > 0 and parent_from_list:
+                    # FIX (ok.20150702): Check if actual parent is one of parent_from_list instead of parent
+                    caller_mod_name = globals.get('__name__', None)
+                    if caller_mod_name is not None and caller_mod_name in sys.modules:
+                        if caller_mod_name.startswith(parent + '.'):
+                            tail = caller_mod_name[len(parent + '.'):]
+                            if tail in parent_from_list:
+                                actual_parent = caller_mod_name
+
+                _add_dependency(actual_parent, m, m_sub)
+
+            elif globals is not None:
+                # FIX (ok.20150702): for run-time imports
+                caller_mod_name = globals.get('__name__', None)
+                rt_parent = caller_mod_name and sys.modules.get(caller_mod_name)
+                if rt_parent is not None:
+                    _add_dependency(rt_parent, m, m_sub)
 
     # Lastly, we always restore our global _parent pointer.
     _parent = parent
+    _parent_from_list = parent_from_list
 
     return base
+
+def _add_dependency(parent, mod, mod_subs=None):
+    l = _dependencies.setdefault(parent.__name__ if isinstance(parent, types.ModuleType) else parent, [])
+    for m in [mod] + (mod_subs or []):
+        if m not in l:
+            l.append(m)
